@@ -378,6 +378,18 @@ group("Format Findings");
 }
 
 
+
+// ── 洞 3：中段 cd（mkdir x && cd x && git commit 原本掃錯 repo）──
+// getCommandCwd 未 export，行為由 e2e 沙箱驗證；這裡先驗證「解析輸入」層：
+// 複合指令的 git 段仍應被 detectGitAction 抓到
+{
+	const t = (label: string, got: unknown, exp: unknown) =>
+		assert(`${label} → ${JSON.stringify(got)}`, JSON.stringify(got) === JSON.stringify(exp));
+	t("compound: mkdir+cd+commit 仍偵測到 commit", detectGitAction("mkdir /tmp/x && cd /tmp/x && git init && git commit -m m"), "commit");
+	t("compound: 中段 cd + push", detectGitAction("mkdir /tmp/y && cd /tmp/y && git push"), "push");
+	t("compound: 純 git 段不受干擾", detectGitAction("cd /a && ls && cd /b && git status"), null);
+}
+
 // ============================================================================
 // Summary
 // ============================================================================

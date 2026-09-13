@@ -91,13 +91,29 @@ function getSessionCwd(pi: ExtensionAPI): string {
  *   cd /repo && git commit ...
  * Falls back to the session cwd.
  */
+/**
+ * Best-effort extraction of the command cwd for patterns like:
+ *   cd /repo && git commit ...
+ *   mkdir x && cd x && git commit ...
+ * 解析「最後一個」cd 段——git 指令真正執行時所在的 cwd。
+ * 舊版只認「開頭的 cd」（regex 錨定 ^），中段 cd 會被略過 → 掃錯 repo →
+ * diff 空 → 放行（實測：mkdir x && cd x && git commit 漏擋）。
+ * 相對路徑以「前一個 cd 的結果」為基準累積解析，模擬 shell 的行為。
+ */
 function getCommandCwd(command: string, fallbackCwd: string): string {
 	const trimmed = command.trim();
-	const match = trimmed.match(/^cd\s+((?:"[^"]+"|'[^']+'|[^&;|])+?)\s*&&/);
-	if (!match) return fallbackCwd;
-	const rawPath = stripQuotes(match[1]);
-	if (!rawPath) return fallbackCwd;
-	return isAbsolute(rawPath) ? rawPath : resolve(fallbackCwd, rawPath);
+	const segments = trimmed.split(/(?:&&|\|\||;|\n)/).map((s) => s.trim()).filter(Boolean);
+	let cwd = fallbackCwd;
+	let sawCd = false;
+	for (const seg of segments) {
+		const m = seg.match(/^cd\s+((?:"[^"]+"|'[^']+'|\S+))\s*$/);
+		if (!m) continue;
+		const rawPath = stripQuotes(m[1]);
+		if (!rawPath) continue;
+		cwd = isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath);
+		sawCd = true;
+	}
+	return sawCd ? cwd : fallbackCwd;
 }
 
 async function getRepoRoot(cwd: string): Promise<string | null> {
