@@ -163,8 +163,38 @@ function splitShellSegments(command: string): string[] {
 }
 
 /**
+ * Detect the scope flags of a git add segment.
+ * Returns "all" (−A/−−all/−· or a bare dot), "update" (−u), or "paths".
+ *
+ * 為什麼需要：攔截發生在 git add 執行「之前」，此刻 staged diff 必為空。
+ * 舊版在此直接跳過 −A/−−all/−u（註解寫「we'll use diff instead」），但未追蹤
+ * 的新檔案在那個時點既不在 staged diff 也不在 unstaged diff —— 「用 diff 代替」
+ * 的假設對新檔案不成立，結果 diff 永遠為空 → 早退 → 放行（演練 A 實證漏擋）。
+ */
+export type GitAddScope = "all" | "update" | "paths";
+
+export function detectGitAddScope(segment: string): GitAddScope | null {
+	// 先抽 shell wrapper（bash -c "git add ..."），再測 regex——
+	// 直接 regex 對 wrapper 形式必失敗（引號擋在中間），原版順序反了
+	const innerSegment = extractGitFromShellWrapper(segment);
+	if (!GIT_ADD_SEGMENT_RE.test(innerSegment)) return null;
+	const addMatch = innerSegment.match(/git\s+add\s+(.+)/);
+	if (!addMatch) return null;
+	const addArgs = addMatch[1];
+	// −A / −−all / −· / 裸的「.」都視為全部
+	if (/\s-[uA]|\s--all|\s--update\b/.test(addArgs)) return "all";
+	if (/(?:^|\s)\.\s*$/.test(addArgs) || addArgs.trim() === ".") return "all";
+	// 只掃到 flag（無任何路徑）也是全部
+	const filePatterns = addArgs.match(/(?:^|\s)([^-\s][^\s]*)/g);
+	if (!filePatterns || filePatterns.length === 0) return "all";
+	return "paths";
+}
+
+/**
  * Extract files that would be added by git add commands in the command line.
- * Handles patterns like: git add .env, git add ., git add src/*.ts, etc.
+ * Handles patterns like: git add .env, git add src/*.ts, etc.
+ * （−A/−−all/−·/「.」/−u 的情況改由 detectGitAddScope 標記，
+ *   由 index.ts 改問 git 本身要「會被加進去的檔案清單」——見 resolveAddTargets。）
  */
 export function extractGitAddFiles(command: string): string[] {
 	const segments = splitShellSegments(command);
@@ -183,7 +213,7 @@ export function extractGitAddFiles(command: string): string[] {
 		if (!addMatch) continue;
 
 		const addArgs = addMatch[1];
-		// Skip if -u (update) or -A/--all flags are used (we'll use diff instead)
+		// Skip if -u (update) or -A/--all flags are used (handled via detectGitAddScope)
 		if (/\s-[uA]|\s--all|\s--update\b/.test(addArgs)) continue;
 
 		// Extract file patterns (everything that's not a flag)

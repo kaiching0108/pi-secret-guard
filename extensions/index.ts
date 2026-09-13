@@ -26,6 +26,8 @@ import {
 	detectGitAction,
 	isCommitAll,
 	extractGitAddFiles,
+	detectGitAddScope,
+	type GitAddScope,
 	hashDiff,
 	scanDiffForSecrets,
 	scanFileNames,
@@ -139,6 +141,39 @@ function saveReviewState(stateFilePath: string, state: PersistedReviewState): vo
 }
 
 /**
+ * Resolve the files a pending `git add` would stage, by asking git itself.
+ * 舊版解析 add 的檔名參數，但 `git add .` 對目錄 readFileSync 會 throw、
+ * 被吞掉後一樣放行；`-A` 更是根本無法從指令列還原清單。
+ * 改問 git：未追蹤（尊重 .gitignore）＋已追蹤但已修改的檔案。
+ * 注意這是「超集掃描」：add 在子目錄跑時會多掃根目錄的未追蹤檔——寧可多掃不可漏掃。
+ */
+async function resolveAddTargets(
+	scope: GitAddScope,
+	command: string,
+	cwd: string,
+): Promise<string[]> {
+	if (scope === "paths") {
+		// 明確檔名：沿用原本的解析（已驗證有效）
+		return extractGitAddFiles(command);
+	}
+	const args =
+		scope === "update"
+			? ["diff", "--name-only", "--no-color"]
+			: ["ls-files", "--others", "--exclude-standard"];
+	const result = await execGit(args, cwd);
+	if (result.code !== 0) return [];
+	const listed = result.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+	if (scope === "update") return listed;
+	// "all"：未追蹤之外，還要加上「已追蹤但已修改」的檔案（它們也會被 -A stage 進去）
+	const modified = await execGit(["diff", "--name-only", "--no-color"], cwd);
+	const modifiedList =
+		modified.code === 0
+			? modified.stdout.split("\n").map((l) => l.trim()).filter(Boolean)
+			: [];
+	return [...new Set([...listed, ...modifiedList])];
+}
+
+/**
  * Build a synthetic diff from file contents for files being added via git add.
  * This is needed when git add and git commit are in the same command -
  * the staged diff is empty when we check because git add hasn't run yet.
@@ -216,27 +251,62 @@ export default function (pi: ExtensionAPI) {
 			// scan the files being added directly.
 			// This handles compound commands like "git add .env && git commit"
 			if (!diff.trim()) {
-				const addFiles = extractGitAddFiles(command);
+				let addFiles: string[] = [];
+				for (const segment of command.split(/(?:&&|\|\||;|\n)/)) {
+					const scope = detectGitAddScope(segment);
+					if (!scope) continue;
+					const resolved = await resolveAddTargets(scope, segment, commandCwd);
+					if (resolved.length > 0) {
+						addFiles = addFiles.concat(resolved);
+						break; // 第一個有產出的 add 已涵蓋（超集掃描已保險）
+					}
+				}
 				if (addFiles.length > 0) {
 					diff = buildDiffFromFiles(addFiles, commandCwd);
 				}
 			}
 		} else {
-			// Push — check unpushed commits against upstream
+			// Push — check unpushed commits against upstream.
+			// 演練 C1：無 upstream（首次推送）時舊版 diff 為空 → 註解明寫「skip the check」
+			// → fail-open，秘密直接上遠端。改 fail-closed：先數未推送 commit，
+			// 有 commit 但拿不到 diff 就逐 commit git show 掃描。
 			const result = await execGit(["diff", "@{u}..HEAD", "--no-color"], commandCwd);
-			if (result.code !== 0) {
-				// No upstream configured — try common remote branch names
-				for (const ref of ["origin/main", "origin/master"]) {
-					const fallback = await execGit(["diff", `${ref}..HEAD`, "--no-color"], commandCwd);
-					if (fallback.code === 0) {
-						diff = fallback.stdout;
-						break;
+			if (result.code === 0 && result.stdout.trim()) {
+				diff = result.stdout;
+			} else {
+				// 有沒有未推送的 commit？（不依賴 upstream 設定）
+				const pending = await execGit(
+					["rev-list", "--count", "HEAD", "--not", "--remotes"],
+					commandCwd,
+				);
+				const pendingCount = pending.code === 0 ? parseInt(pending.stdout.trim(), 10) : 0;
+				if (pendingCount > 0) {
+					// 逐 commit 掃（零設定也能涵蓋首次推送）
+					const shows = await execGit(
+						["log", "--format=%H", "--max-count=20", "HEAD", "--not", "--remotes"],
+						commandCwd,
+					);
+					if (shows.code === 0 && shows.stdout.trim()) {
+						const parts: string[] = [];
+						for (const sha of shows.stdout.trim().split("\n").slice(0, 20)) {
+							const show = await execGit(["show", "--no-color", "--format=", sha], commandCwd);
+							if (show.code === 0 && show.stdout.trim()) parts.push(show.stdout);
+						}
+						diff = parts.join("\n");
+					}
+					if (!diff.trim()) {
+						// 有未推送 commit 卻拿不到任何 diff → 拒絕，不猜
+						return {
+							block: true,
+							reason: [
+								`🚨 SECRET GUARD: ${pendingCount} unpushed commit(s) detected but no diff could be read.`,
+								`Refusing to push without scanning (fail-closed).`,
+								`Run the same push again after confirming the commits are clean, or inspect them with: git log --stat --not --remotes`,
+							].join("\n"),
+						};
 					}
 				}
-				// If we still have no diff, we can't determine what's being pushed.
-				// Fall through — if diff is empty, we'll skip the check.
-			} else {
-				diff = result.stdout;
+				// pendingCount === 0 且無 upstream：沒有要推的東西，交給 git 自己報錯
 			}
 		}
 

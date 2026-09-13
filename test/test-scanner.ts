@@ -12,6 +12,7 @@ import {
 	scanDiffForSecrets,
 	scanFileNames,
 	formatFindings,
+	detectGitAddScope,
 } from "../extensions/scanner.ts";
 
 // ============================================================================
@@ -352,6 +353,30 @@ group("Format Findings");
 	assert("Contains 🟡 marker", formatted.includes("🟡"));
 	assert("Contains file path", formatted.includes("config.ts"));
 }
+
+
+// ============================================================================
+// Fix regression tests（演練 A / C1 的兩個洞）
+// ============================================================================
+
+// ── 洞 1：git add -A / add . 複合指令（原本會放行）──
+{
+	const t = (label: string, got: unknown, exp: unknown) =>
+		assert(`${label} → ${JSON.stringify(got)}`, JSON.stringify(got) === JSON.stringify(exp));
+
+	t("scope: git add -A", detectGitAddScope("git add -A"), "all");
+	t("scope: git add .", detectGitAddScope("git add ."), "all");
+	t("scope: git add -u", detectGitAddScope("git add -u"), "all");
+	t("scope: git add --all", detectGitAddScope("git add --all"), "all");
+	t("scope: git add config.ini", detectGitAddScope("git add config.ini"), "paths");
+	t("scope: git add src/", detectGitAddScope("git add src/"), "paths");
+	t("scope: git status", detectGitAddScope("git status"), null);
+	t("scope: bash -c 'git add .'", detectGitAddScope('bash -c "git add ."'), "all");
+	t("scope: cd /x && git add -A", detectGitAddScope("cd /x && git add -A".split("&&")[1].trim()), "all");
+	// 複合指令整體（splitShellSegments 之後的行為）
+	t("scope in compound: 'git add -A && git commit'", detectGitAddScope("git add -A && git commit".split("&&")[0].trim()), "all");
+}
+
 
 // ============================================================================
 // Summary
